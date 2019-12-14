@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import math
 from model.transformer_model import TransformerModel
+from model.riemannian_transformer_model import RiemannianTransformerModel
 import numpy as np
 from torch.autograd import Variable
 from torch.utils.tensorboard import SummaryWriter
@@ -12,12 +13,13 @@ from tqdm import tqdm
 import os
 from os import listdir
 from os.path import isfile, join
+from riemann.rsgd_multithread import RiemannianSGD
 import gc
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-writer = SummaryWriter()
+writer = SummaryWriter("runs_debug")
 
-batch_size = 400
+batch_size = 30
 eval_batch_size = 10
 
 """
@@ -91,6 +93,7 @@ easy_train = combine_datasets(list(get_datasets_from_dir("./mathematics_dataset-
 med_train = combine_datasets(list(get_datasets_from_dir("./mathematics_dataset-v1.0/train-medium/", data_fields, True).values()), data_fields)
 hard_train = combine_datasets(list(get_datasets_from_dir("./mathematics_dataset-v1.0/train-hard/", data_fields, True).values()), data_fields)
 total_train = combine_datasets([easy_train, med_train, hard_train], data_fields)
+# easy_med_train = combine_datasets([easy_train, med_train], data_fields)
 
 IN_TEXT.build_vocab(interp, extrap, total_train)
 OUT_TEXT.build_vocab(interp, extrap, total_train)
@@ -99,7 +102,16 @@ OUT_TEXT.build_vocab(interp, extrap, total_train)
 # val_iter = BucketIterator(val, batch_size=batch_size, sort_key=lambda x: len(x.answer), shuffle=True)
 interp_iter = Iterator(interp, batch_size=batch_size, shuffle=True, sort=False)
 extrap_iter = Iterator(extrap, batch_size=batch_size, shuffle=True, sort=False)
-train_iter = Iterator(total_train, batch_size=batch_size, shuffle=True, sort=False)
+
+curriculum = False
+iteration_switches = [50000,100000]
+#curriculum_datasets = [easy_train, easy_med_train, total_train]
+current_curriculum_switch = 0
+train_iter = None
+if curriculum:
+    train_iter = Iterator(curriculum_datasets[0], batch_size=batch_size, shuffle=True, sort=False)
+else:
+    train_iter = Iterator(total_train, batch_size=batch_size, shuffle=True, sort=False)
 
 ntokens = len(IN_TEXT.vocab.stoi) # the size of vocabulary
 ntokens_dec = len(OUT_TEXT.vocab.stoi)
@@ -107,16 +119,18 @@ emsize = 200 # embedding dimension
 nhid = 200 # the dimension of the feedforward network model in nn.TransformerEncoder
 nlayers = 2 # the number of nn.TransformerEncoderLayer in nn.TransformerEncoder
 nhead = 2 # the number of heads in the multiheadattention models
-dropout = 0 # the dropout value
-model = TransformerModel(emsize, ntokens, ntokens_dec, dropout=dropout)
-model_name = "default_transformer"
+dropout = 0 # the dropout value, batch_size=batch_size, shuffle=True, sort=False
+model = RiemannianTransformerModel(emsize, ntokens, ntokens_dec, dropout=dropout)
+model_name = "riemannian_transformer"
 model.to(device)
 
 lr = 0.0001 # learning rate
-optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(.9, .995), eps=1e-9)
+# optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(.9, .995), eps=1e-9)
+optimizer = RiemannianSGD(model.parameters(), lr=lr)
 # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
 
 best_extrap_loss = float("inf")
+iterations = 0
 
 import time
 
@@ -149,11 +163,18 @@ def create_masks(src, trg):
 def train():
     model.train() # Turn on the train mode
     global best_extrap_loss
+    global iterations
+    global current_curriculum_switch
+    global train_iter
     total_loss = 0.
     start_time = time.time()
     ntokens = len(IN_TEXT.vocab.stoi)
     from tqdm import tqdm
     for i, batch in tqdm(enumerate(train_iter)):
+        if curriculum and current_curriculum_switch < len(iteration_switches) and iterations > iteration_switches[current_curriculum_switch]:
+            current_curriculum_switch += 1
+            train_iter = Iterator(curriculum_datasets[current_curriculum_switch], batch_size=batch_size, shuffle=True, sort=False)
+            break
         optimizer.zero_grad()
         src = batch.question.transpose(0,1).to(device)
         trg = batch.answer.transpose(0,1).to(device)
@@ -167,10 +188,10 @@ def train():
         optimizer.step()
 
         total_loss += loss.item()
-        writer.add_scalar('loss/train', loss.item(), i + (epoch - 1) * len(train_iter))
+        writer.add_scalar('loss/train', loss.item(), iterations)
         log_interval = 500
         generate_interval = 500
-        if (i + (epoch - 1) * len(train_iter)) % log_interval == 0 and (i + (epoch - 1) * len(train_iter)) > 0:
+        if iterations % log_interval == 0 and iterations > 0:
             cur_loss = total_loss / log_interval
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | '
@@ -179,21 +200,22 @@ def train():
                     epoch, i, len(train_iter), 0.01, #scheduler.get_lr()[0],
                     elapsed * 1000 / log_interval,
                     cur_loss, math.exp(cur_loss)))
-            generate = i % generate_interval == 0
+            generate = iterations % generate_interval == 0
             total_loss, (total_right, total_tested) = evaluate(model, interp_iter, generate)
-            writer.add_scalar('loss/interp', total_loss, i + (epoch - 1) * len(train_iter))
+            writer.add_scalar('loss/interp', total_loss, iterations)
             if generate:
-                writer.add_scalar('acc/interp', total_right.float() / total_tested, i + (epoch - 1) * len(train_iter))
+                writer.add_scalar('acc/interp', total_right.float() / total_tested, iterations)
 
             total_loss, (total_right, total_tested) = evaluate(model, extrap_iter, generate)
-            writer.add_scalar('loss/extrap', total_loss, i + (epoch - 1) * len(train_iter))
+            writer.add_scalar('loss/extrap', total_loss, iterations)
             if generate:
-                writer.add_scalar('acc/extrap', total_right.float() / total_tested, i + (epoch - 1) * len(train_iter))
+                writer.add_scalar('acc/extrap', total_right.float() / total_tested, iterations)
             if total_loss < best_extrap_loss:
                 best_extrap_loss = total_loss
-                model.save(f"models/{model_name}.pkl")
+                model.save(f"models/{model_name}_debug.pkl")
             total_loss = 0
             start_time = time.time()
+        iterations += 1
 
 def evaluate(eval_model, data_iter, generate=True, num_batches=50):
     eval_model.eval() # Turn on the evaluation mode

@@ -20,3 +20,8 @@ class PositionalEncoding(nn.Module):
         x = x.transpose(0,1)
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x).transpose(0,1)
+
+    def compute_pe(self, x, normalization=0.001):
+        x = x.transpose(0,1)
+        return normalization*self.pe[:x.size(0), :].transpose(0,1)
+

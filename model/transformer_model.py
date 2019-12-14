@@ -47,9 +47,5 @@ class TransformerModel(nn.Module):
     def save(self, file_dir):
         torch.save(self.state_dict(), file_dir)
 
-
-
-            
-
-
-
+    def load(self, file_dir):
+        self.load_state_dict(torch.load(file_dir))
